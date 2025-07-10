@@ -161,18 +161,6 @@ class CompleteGraphGenerator:
             # ENFORCE: Use the graph_type from graph_data (set by tool call override logic)
             requested_graph_type = graph_data.get('graph_type', '').lower()
             query_lower = query.lower()
-            # HANDLE "TRY AGAIN" - retry previous user query if requested
-            if query_lower in ['try again', 'retry', 'fix it', 'try that again']:
-                # Get the most recent user query from history (exclude 'try again')
-                recent_user_queries = [line[6:] for line in history if line.startswith('User: ') and 
-                                    not any(retry_word in line.lower() for retry_word in ['try again', 'retry', 'fix it'])]
-                if recent_user_queries:
-                    original_query = recent_user_queries[-1]  # Most recent actual query
-                    logger.info(f"[TRY AGAIN] Retrying with original query: {original_query}")
-                    query = original_query
-                    query_lower = query.lower().strip()
-                else:
-                    logger.warning("[TRY AGAIN] No previous query found in history")
             logger.info(f"[GRAPH] Received graph_type: '{requested_graph_type}' from tool call. Query: {query}")
             
             # Only use requested_graph_type if valid, else fallback to smart detection
@@ -259,52 +247,58 @@ class CompleteGraphGenerator:
                             return False
                     
                     elif graph_type in ['bar', 'horizontal_bar']:
-                        # FIXED: Better handling for bar charts
-                        if len(columns) >= 2:
-                            # Smart column detection
-                            category_col = columns[0]  # Usually the first column is the category
-                            value_col = columns[1]     # Usually the second column is the value
-                            
-                            # Try to find better value column
-                            for col in columns:
-                                col_lower = col.lower()
-                                if any(keyword in col_lower for keyword in ['amount', 'total', 'count', 'num', 'value', 'payment', 'revenue']):
-                                    value_col = col
-                                    break
-                            
-                            # Prepare bar chart data
-                            categories = []
-                            values = []
-                            
+                        # Accept both 'categories'/'values' and 'category'/'value' for bar charts
+                        # Try to find the best matching columns
+                        category_col = None
+                        value_col = None
+                        for col in columns:
+                            col_lower = col.lower()
+                            if col_lower in ['categories', 'category', 'status', 'type', 'label']:
+                                category_col = col
+                            elif col_lower in ['values', 'value', 'count', 'amount', 'total', 'num']:
+                                value_col = col
+                        # Fallback to first two columns if no exact match
+                        if not category_col and len(columns) >= 1:
+                            category_col = columns[0]
+                        if not value_col and len(columns) >= 2:
+                            value_col = columns[1]
+                        # Prepare bar chart data
+                        categories = []
+                        values = []
+                        if category_col and value_col:
                             for row in raw_data:
                                 cat_val = row.get(category_col)
                                 num_val = row.get(value_col)
-                                
                                 if cat_val is not None and num_val is not None:
                                     # Truncate long category names for better display
                                     cat_str = str(cat_val)
                                     if len(cat_str) > 15:
                                         cat_str = cat_str[:12] + "..."
                                     categories.append(cat_str)
-                                    
                                     try:
                                         values.append(float(num_val))
                                     except (ValueError, TypeError):
                                         values.append(0)
-                            
-                            if categories and values and len(categories) == len(values):
-                                graph_data['x_values'] = categories
-                                graph_data['y_values'] = values
-                                graph_data['x_label'] = category_col.replace('_', ' ').title()
-                                graph_data['y_label'] = value_col.replace('_', ' ').title()
-                                logger.info(f"[BAR] Prepared data: {len(categories)} categories, {len(values)} values")
-                                logger.info(f"[BAR] Sample data: {categories[:3]} -> {values[:3]}")
-                                return True
-                            else:
-                                logger.error(f"[BAR] Data preparation failed: categories={len(categories)}, values={len(values)}")
-                                return False
+                        # If not found, try to use 'categories'/'values' keys directly if present
+                        if not categories and not values:
+                            if 'categories' in graph_data and 'values' in graph_data:
+                                categories = graph_data['categories']
+                                values = graph_data['values']
+                        # If not found, try to use 'category'/'value' keys directly if present
+                        if not categories and not values:
+                            if 'category' in graph_data and 'value' in graph_data:
+                                categories = graph_data['category']
+                                values = graph_data['value']
+                        if categories and values and len(categories) == len(values):
+                            graph_data['x_values'] = categories
+                            graph_data['y_values'] = values
+                            graph_data['x_label'] = (category_col or 'Category').replace('_', ' ').title()
+                            graph_data['y_label'] = (value_col or 'Value').replace('_', ' ').title()
+                            logger.info(f"[BAR] Prepared data: {len(categories)} categories, {len(values)} values")
+                            logger.info(f"[BAR] Sample data: {categories[:3]} -> {values[:3]}")
+                            return True
                         else:
-                            logger.error(f"[BAR] Insufficient columns for bar chart: {len(columns)}")
+                            logger.error(f"[BAR] Data preparation failed: categories={len(categories)}, values={len(values)}")
                             return False
                     
                     elif graph_type == 'line':
@@ -316,7 +310,7 @@ class CompleteGraphGenerator:
                             # Try to find better time/value columns
                             for col in columns:
                                 col_lower = col.lower()
-                                if any(keyword in col_lower for keyword in ['date', 'time', 'period', 'month', 'year']):
+                                if any(keyword in col_lower for keyword in ['date', 'time', 'period', 'month', 'year', 'week']):
                                     x_col = col
                                 elif any(keyword in col_lower for keyword in ['amount', 'total', 'count', 'value', 'revenue']):
                                     y_col = col
@@ -335,6 +329,62 @@ class CompleteGraphGenerator:
                                     except (ValueError, TypeError):
                                         y_values.append(0)
                             
+                            # PATCH: Fill missing periods with zero values for time series
+                            if x_col and y_col and x_values:
+                                # Detect if x_col is week or month period
+                                import re
+                                week_pattern = re.compile(r'^(\d{4})-W(\d{2})$')
+                                month_pattern = re.compile(r'^(\d{4})-(\d{2})$')
+                                # Only patch if all x_values match week or month pattern
+                                if all(week_pattern.match(x) for x in x_values):
+                                    # Fill missing weeks
+                                    years_weeks = [tuple(map(int, m.groups())) for x in x_values if (m := week_pattern.match(x))]
+                                    min_year, min_week = min(years_weeks)
+                                    max_year, max_week = max(years_weeks)
+                                    # Build all weeks in range
+                                    from datetime import date, timedelta
+                                    def week_to_date(year, week):
+                                        return date.fromisocalendar(year, week, 1)
+                                    all_weeks = set()
+                                    d = week_to_date(min_year, min_week)
+                                    end = week_to_date(max_year, max_week)
+                                    while d <= end:
+                                        iso_year, iso_week, _ = d.isocalendar()
+                                        all_weeks.add((iso_year, iso_week))
+                                        d += timedelta(weeks=1)
+                                    # Map x_values to y_values
+                                    week_to_value = {yw: y for yw, y in zip(years_weeks, y_values)}
+                                    filled_x = []
+                                    filled_y = []
+                                    for yw in sorted(all_weeks):
+                                        label = f"{yw[0]}-W{str(yw[1]).zfill(2)}"
+                                        filled_x.append(label)
+                                        filled_y.append(week_to_value.get(yw, 0))
+                                    x_values = filled_x
+                                    y_values = filled_y
+                                elif all(month_pattern.match(x) for x in x_values):
+                                    # Fill missing months
+                                    months = [tuple(map(int, m.groups())) for x in x_values if (m := month_pattern.match(x))]
+                                    min_year, min_month = min(months)
+                                    max_year, max_month = max(months)
+                                    all_months = []
+                                    y, m = min_year, min_month
+                                    while (y, m) <= (max_year, max_month):
+                                        all_months.append((y, m))
+                                        if m == 12:
+                                            y += 1
+                                            m = 1
+                                        else:
+                                            m += 1
+                                    month_to_value = {ym: y for ym, y in zip(months, y_values)}
+                                    filled_x = []
+                                    filled_y = []
+                                    for ym in all_months:
+                                        label = f"{ym[0]}-{str(ym[1]).zfill(2)}"
+                                        filled_x.append(label)
+                                        filled_y.append(month_to_value.get(ym, 0))
+                                    x_values = filled_x
+                                    y_values = filled_y
                             if x_values and y_values and len(x_values) == len(y_values):
                                 graph_data['x_values'] = x_values
                                 graph_data['y_values'] = y_values
@@ -896,6 +946,8 @@ class CompleteSmartNLPProcessor:
         self.db_schema = self._get_complete_database_schema()
         self.chart_keywords = self._get_chart_keywords()
         self.tools = self._get_tools_config()
+        self.last_feedback = None
+        self.last_feedback_query = None
 
     async def _generate_with_complete_retries(self, prompt: str, query: str, chart_analysis: Dict, max_retries: int = 3) -> List[Dict]:
         """Generate AI response with retries and better error handling"""
@@ -1002,7 +1054,8 @@ class CompleteSmartNLPProcessor:
                 sql_query = sql_query.strip().rstrip(';')
                 break
         if sql_query:
-            wants_graph = any(word in query_lower for word in ['chart', 'graph', 'visualize', 'plot'])
+            # ENFORCE: Always use graph tool if visualization is requested
+            wants_graph = chart_analysis.get('wants_visualization', False) or any(word in query_lower for word in ['chart', 'graph', 'visualize', 'plot'])
             tool_name = 'execute_dynamic_sql_with_graph' if wants_graph else 'execute_dynamic_sql'
             tool_call = {
                 'tool': tool_name,
@@ -1011,9 +1064,11 @@ class CompleteSmartNLPProcessor:
                 'wants_graph': wants_graph,
                 'chart_analysis': chart_analysis or {'chart_type': 'none'}
             }
-            if wants_graph and 'graph_type' not in tool_call['parameters']:
+            if wants_graph:
+                tool_call['tool'] = 'execute_dynamic_sql_with_graph'
+                tool_call['wants_graph'] = True
                 tool_call['parameters']['graph_type'] = chart_analysis.get('chart_type', 'bar')
-            logger.info(f"🔧 Extracted SQL tool call: {tool_name}")
+            logger.info(f"🔧 Extracted SQL tool call: {tool_call['tool']} (wants_graph: {wants_graph})")
             return [tool_call]
         if 'database_status' in text.lower() or 'get_database_status' in text.lower():
             return [{
@@ -1102,10 +1157,10 @@ CRITICAL SCHEMA RULES:
     def _get_chart_keywords(self) -> Dict[str, List[str]]:
         """Chart type keywords for better detection."""
         return {
-            'pie': ['pie', 'pie chart', 'distribution', 'breakdown', 'percentage', 'proportion', 'rate', 'visually'],
-            'line': ['line', 'trend', 'over time', 'timeline', 'time series', 'progression'],
-            'bar': ['bar', 'comparison', 'compare', 'versus', 'vs'],
-            'scatter': ['scatter', 'correlation', 'relationship', 'plot']
+            'pie': ['pie', 'pie chart', 'distribution', 'breakdown', 'percentage', 'proportion', 'success rate', 'payment success'],
+            'line': ['line', 'trend', 'over time', 'timeline', 'time series', 'progression', 'line chart', 'line graph', 'weekly', 'monthly', 'daily'],
+            'bar': ['bar', 'comparison', 'compare', 'versus', 'vs', 'bar chart', 'bar graph', 'top', 'merchants by', 'ranking'],
+            'scatter': ['scatter', 'correlation', 'relationship', 'plot', 'scatter plot']
         }
 
     def _get_tools_config(self):
@@ -1193,6 +1248,13 @@ CRITICAL SCHEMA RULES:
         ):
             if is_time_period_comparison or (len(threshold_info['numbers']) >= 2):
                 is_comparison = True
+        # Check for business summary queries that should be split
+        business_summary_patterns = [
+            'business health summary', 'business summary', 'give me a summary',
+            'what was', 'how many', 'what is', 'tell me'
+        ]
+        is_business_summary = any(pattern in query_lower for pattern in business_summary_patterns) and (query_lower.count(',') >= 2 or 'what was' in query_lower and 'how many' in query_lower)
+        
         complex_patterns = [
             'list of customers', 'show me their', 'customers who have', 
             'users who have', 'find customers', 'get customers',
@@ -1207,9 +1269,29 @@ CRITICAL SCHEMA RULES:
             'october', 'november', 'december', 'january', 'february', 'march',
             '2024', '2025', 'date'
         ])
+        
+        # Override complex_analytical for business summary queries
+        if is_business_summary:
+            is_complex_analytical = False
+            
+        # IMPROVED: Better detection of multi-part queries with different chart types
+        chart_type_indicators = ['pie chart', 'bar chart', 'line chart', 'scatter plot']
+        has_multiple_chart_types = sum(1 for indicator in chart_type_indicators if indicator in query_lower) >= 2
+        
+        # Check for explicit multi-part queries with semicolons or "and" with different chart types
+        has_explicit_separators = any(sep in user_query for sep in [';', ' and ', '\n'])
+        
+        # FORCE: Always split queries that contain multiple chart type indicators
+        if has_multiple_chart_types:
+            logger.info(f"🔧 FORCE SPLIT: Detected multiple chart types in query: {[indicator for indicator in chart_type_indicators if indicator in query_lower]}")
+            is_complex_analytical = False  # Override to force splitting
+        
         if not is_comparison and not is_complex_analytical and not is_date_range_query:
+            # IMPROVED: Better splitting logic for multi-part queries
             query_separators = [' and ', ';', '\n']
             individual_queries = [user_query.strip()]
+            
+            # First pass: Split by explicit separators
             for separator in query_separators:
                 new_queries = []
                 for query in individual_queries:
@@ -1219,20 +1301,132 @@ CRITICAL SCHEMA RULES:
                     else:
                         new_queries.append(query)
                 individual_queries = new_queries
+            
+            # Second pass: If we have multiple chart type indicators, try to split more aggressively
+            if has_multiple_chart_types and len(individual_queries) == 1:
+                # Look for natural break points around chart type indicators
+                query_text = individual_queries[0]
+                chart_splits = []
+                
+                # Find positions of chart type indicators
+                chart_positions = []
+                for indicator in chart_type_indicators:
+                    pos = query_text.lower().find(indicator)
+                    if pos != -1:
+                        chart_positions.append((pos, indicator))
+                
+                if len(chart_positions) >= 2:
+                    # Sort by position
+                    chart_positions.sort()
+                    
+                    # Split around chart indicators
+                    last_pos = 0
+                    for pos, indicator in chart_positions:
+                        # Look for a good break point before this chart indicator
+                        # Try to find "show me", "create", "generate" before the chart type
+                        break_point = pos
+                        for break_phrase in ['show me', 'create', 'generate', 'make']:
+                            phrase_pos = query_text.lower().rfind(break_phrase, last_pos, pos)
+                            if phrase_pos != -1:
+                                break_point = phrase_pos
+                                break
+                        
+                        if break_point > last_pos:
+                            chart_splits.append(query_text[last_pos:break_point].strip())
+                        last_pos = break_point
+                    
+                    # Add the last part
+                    if last_pos < len(query_text):
+                        chart_splits.append(query_text[last_pos:].strip())
+                    
+                    if len(chart_splits) >= 2:
+                        individual_queries = [q for q in chart_splits if q.strip()]
+                
+                # IMPROVED: If the above didn't work, try splitting by semicolon first, then by "and"
+                if len(individual_queries) == 1 and has_multiple_chart_types:
+                    logger.info("🔧 FORCE SPLIT: Trying alternative splitting methods")
+                    
+                    # Try semicolon split first
+                    if ';' in query_text:
+                        parts = [part.strip() for part in query_text.split(';') if part.strip()]
+                        if len(parts) >= 2:
+                            individual_queries = parts
+                            logger.info(f"🔧 SPLIT: Split by semicolon into {len(parts)} parts")
+                    
+                    # If still single query, try "and" split
+                    elif len(individual_queries) == 1 and ' and ' in query_text:
+                        parts = [part.strip() for part in query_text.split(' and ') if part.strip()]
+                        if len(parts) >= 2:
+                            individual_queries = parts
+                            logger.info(f"🔧 SPLIT: Split by 'and' into {len(parts)} parts")
+            
             seen = set()
             unique_queries = []
             for query in individual_queries:
                 if query.lower() not in seen:
                     seen.add(query.lower())
                     unique_queries.append(query)
+        elif is_business_summary:
+            # Special handling for business summary queries - split by commas and clean up
+            query_parts = [part.strip() for part in user_query.split(',') if part.strip()]
+            # Remove the summary header and clean up each part
+            cleaned_queries = []
+            for part in query_parts:
+                # Skip the summary header
+                if any(header in part.lower() for header in ['business health summary', 'business summary', 'give me a summary']):
+                    continue
+                # Clean up the part
+                part = part.strip()
+                if part.startswith(':'):
+                    part = part[1:].strip()
+                # Remove leading "and" if present
+                if part.lower().startswith('and '):
+                    part = part[4:].strip()
+                if part:
+                    cleaned_queries.append(part)
+            
+            # If we still don't have enough parts, try splitting by "and" as well
+            if len(cleaned_queries) < 3 and ' and ' in user_query:
+                # Split by "and" and clean up
+                and_parts = [part.strip() for part in user_query.split(' and ') if part.strip()]
+                cleaned_and_queries = []
+                for part in and_parts:
+                    # Skip the summary header
+                    if any(header in part.lower() for header in ['business health summary', 'business summary', 'give me a summary']):
+                        continue
+                    # Clean up the part
+                    part = part.strip()
+                    if part.startswith(':'):
+                        part = part[1:].strip()
+                    if part:
+                        cleaned_and_queries.append(part)
+                
+                # Use the method that gives us more parts
+                if len(cleaned_and_queries) > len(cleaned_queries):
+                    unique_queries = cleaned_and_queries
+                else:
+                    unique_queries = cleaned_queries
+            else:
+                unique_queries = cleaned_queries
         else:
             unique_queries = [user_query.strip()]
+        
         logger.info(f"🔧 MULTITOOL: Processing {len(unique_queries)} individual queries")
         all_tool_calls = []
         for i, query in enumerate(unique_queries, 1):
             logger.info(f"🔧 MULTITOOL: Processing query {i}/{len(unique_queries)}: {query[:50]}...")
             try:
                 query_tool_calls = await self._process_single_query(query, history, client, force_comparison=is_comparison)
+                # ENFORCE: Always use graph tool if visualization is requested
+                for call in query_tool_calls:
+                    chart_analysis = call.get('chart_analysis', {})
+                    if (
+                        (chart_analysis.get('wants_visualization') or chart_analysis.get('chart_type'))
+                        and call['tool'] == 'execute_dynamic_sql'
+                    ):
+                        call['tool'] = 'execute_dynamic_sql_with_graph'
+                        call['wants_graph'] = True
+                        call['parameters']['graph_type'] = chart_analysis.get('chart_type', 'bar')
                 for call in query_tool_calls:
                     call['query_index'] = i
                     call['total_queries'] = len(unique_queries)
@@ -1402,15 +1596,30 @@ CRITICAL SCHEMA RULES:
                     # Extract feedback from the line after "How can this be improved?"
                     # Look for common chart type feedback patterns
                     line_lower = line.lower()
-                    if 'line graph' in line_lower or 'line chart' in line_lower:
-                        recent_feedback = 'line'
-                        logger.info("[TRY AGAIN] Found line chart feedback in history")
-                    elif 'bar graph' in line_lower or 'bar chart' in line_lower:
-                        recent_feedback = 'bar'
-                        logger.info("[TRY AGAIN] Found bar chart feedback in history")
-                    elif 'pie chart' in line_lower or 'pie graph' in line_lower:
+                    
+                    # IMPROVED: More comprehensive chart type detection from feedback
+                    if any(phrase in line_lower for phrase in ['use pie chart', 'pie chart instead', 'try pie chart', 'pie chart would be better', 'pie chart please']):
                         recent_feedback = 'pie'
                         logger.info("[TRY AGAIN] Found pie chart feedback in history")
+                    elif any(phrase in line_lower for phrase in ['use bar chart', 'bar chart instead', 'try bar chart', 'bar chart would be better', 'bar chart please']):
+                        recent_feedback = 'bar'
+                        logger.info("[TRY AGAIN] Found bar chart feedback in history")
+                    elif any(phrase in line_lower for phrase in ['use line chart', 'line chart instead', 'try line chart', 'line chart would be better', 'line chart please', 'use line graph', 'line graph instead', 'try line graph']):
+                        recent_feedback = 'line'
+                        logger.info("[TRY AGAIN] Found line chart feedback in history")
+                    elif any(phrase in line_lower for phrase in ['use scatter', 'scatter plot', 'scatter chart']):
+                        recent_feedback = 'scatter'
+                        logger.info("[TRY AGAIN] Found scatter plot feedback in history")
+                    # Fallback to simple pattern matching if no specific phrases found
+                    elif 'pie chart' in line_lower or 'pie graph' in line_lower:
+                        recent_feedback = 'pie'
+                        logger.info("[TRY AGAIN] Found pie chart feedback in history (fallback)")
+                    elif 'bar chart' in line_lower or 'bar graph' in line_lower:
+                        recent_feedback = 'bar'
+                        logger.info("[TRY AGAIN] Found bar chart feedback in history (fallback)")
+                    elif 'line chart' in line_lower or 'line graph' in line_lower:
+                        recent_feedback = 'line'
+                        logger.info("[TRY AGAIN] Found line chart feedback in history (fallback)")
             
             if recent_user_queries:
                 original_query = recent_user_queries[0]
@@ -1644,13 +1853,13 @@ FROM (SELECT merchant_user_id FROM subscription_contract_v2 GROUP BY merchant_us
                 sql = self._fix_sql_quotes(sql)
                 sql = self._validate_and_autofix_sql(sql)
                 sql = self._fix_sql_date_math(sql, query)
-                
+                # Always use the graph tool for this pattern
                 return [{
-                    'tool': 'execute_dynamic_sql',
-                    'parameters': {'sql_query': sql},
+                    'tool': 'execute_dynamic_sql_with_graph',
+                    'parameters': {'sql_query': sql, 'graph_type': 'bar'},
                     'original_query': query,
-                    'wants_graph': False,
-                    'chart_analysis': {'chart_type': 'none'}
+                    'wants_graph': True,
+                    'chart_analysis': {'chart_type': 'bar'}
                 }]
         
         # 2b. Single threshold
@@ -1798,6 +2007,44 @@ GROUP BY CASE WHEN status = 'ACTIVE' THEN 'Successful' ELSE 'Failed' END
             if not chart_type_override and auto_chart_type:
                 chart_type_override = auto_chart_type
             
+            # IMPROVED: Force graph tool when visualization is requested
+            if chart_analysis.get('wants_visualization', False):
+                logger.info(f"[ENFORCE] Visualization requested, forcing graph tool usage")
+                logger.info(f"[ENFORCE] Chart analysis: {chart_analysis}")
+                logger.info(f"[ENFORCE] Tool calls before conversion: {[tc['tool'] for tc in tool_calls]}")
+                
+                # Convert any execute_dynamic_sql to execute_dynamic_sql_with_graph
+                for call in tool_calls:
+                    if call['tool'] == 'execute_dynamic_sql':
+                        call['tool'] = 'execute_dynamic_sql_with_graph'
+                        call['wants_graph'] = True
+                        logger.info(f"[ENFORCE] Converted execute_dynamic_sql to execute_dynamic_sql_with_graph")
+                
+                # If no graph tool calls exist, create one from the first SQL call
+                if not any(call['tool'] == 'execute_dynamic_sql_with_graph' for call in tool_calls):
+                    logger.info(f"[ENFORCE] No graph tool calls found, creating one from first SQL call")
+                    if tool_calls and tool_calls[0]['tool'] == 'execute_dynamic_sql':
+                        # Convert the first call to graph tool
+                        tool_calls[0]['tool'] = 'execute_dynamic_sql_with_graph'
+                        tool_calls[0]['wants_graph'] = True
+                        logger.info(f"[ENFORCE] Created graph tool call from first SQL call")
+                
+                logger.info(f"[ENFORCE] Tool calls after conversion: {[tc['tool'] for tc in tool_calls]}")
+                
+                # Also set the chart type if detected
+                detected_chart_type = chart_analysis.get('chart_type')
+                if detected_chart_type and detected_chart_type != 'none':
+                    for call in tool_calls:
+                        if call['tool'] == 'execute_dynamic_sql_with_graph':
+                            call['parameters']['graph_type'] = detected_chart_type
+                            logger.info(f"[ENFORCE] Set graph_type to {detected_chart_type} based on chart analysis")
+                else:
+                    # Set default chart type if none detected
+                    for call in tool_calls:
+                        if call['tool'] == 'execute_dynamic_sql_with_graph':
+                            call['parameters']['graph_type'] = 'bar'  # Default to bar chart
+                            logger.info(f"[ENFORCE] Set default graph_type to 'bar'")
+            
             if chart_type_override:
                 for call in tool_calls:
                     if call['tool'] == 'execute_dynamic_sql_with_graph':
@@ -1810,6 +2057,8 @@ GROUP BY CASE WHEN status = 'ACTIVE' THEN 'Successful' ELSE 'Failed' END
                     call['parameters']['sql_query'] = self._fix_sql_quotes(call['parameters']['sql_query'])
                     call['parameters']['sql_query'] = self._validate_and_autofix_sql(call['parameters']['sql_query'])
                     call['parameters']['sql_query'] = self._fix_sql_date_math(call['parameters']['sql_query'], query)
+                    # ENFORCE: Add LIMIT clause for "top N" requests
+                    call['parameters']['sql_query'] = self._enforce_top_n_limit(call['parameters']['sql_query'], query)
             
             enhanced_calls = self._enhance_and_validate_complete_tool_calls(
                 tool_calls, query, chart_analysis, threshold_info
@@ -1846,11 +2095,12 @@ GROUP BY CASE WHEN status = 'ACTIVE' THEN 'Successful' ELSE 'Failed' END
                 logger.warning(f"Could not parse date '{date_str}': {e}")
                 return []
                 
-            # Generate the correct SQL query
-            if 'subscription' in query.lower():
+            # IMPROVED: Generate the correct SQL query with better detection
+            query_lower = query.lower()
+            if any(word in query_lower for word in ['subscription', 'subscriptions']):
                 sql = f"SELECT COUNT(*) as num_subscriptions FROM subscription_contract_v2 WHERE DATE(subcription_start_date) = '{date_str}'"
-            elif 'payment' in query.lower():
-                sql = f"SELECT COUNT(*) as num_payments FROM subscription_payment_details WHERE DATE(created_date) = '{date_str}'"
+            elif any(word in query_lower for word in ['payment', 'payments', 'transaction', 'transactions']):
+                sql = f"SELECT COUNT(*) as num_transactions FROM subscription_payment_details WHERE DATE(created_date) = '{date_str}'"
             else:
                 # Default to subscriptions
                 sql = f"SELECT COUNT(*) as num_subscriptions FROM subscription_contract_v2 WHERE DATE(subcription_start_date) = '{date_str}'"
@@ -2065,6 +2315,8 @@ GROUP BY CASE WHEN status = 'ACTIVE' THEN 'Successful' ELSE 'Failed' END
                 sql = self._fix_field_selection_issues(sql, query)
                 sql = self._validate_field_usage(sql, query)  # Add this critical line
                 sql = self._fix_column_name_typos(sql)  # Add new method
+                # CRITICAL: Add the complete SQL schema fixing
+                sql = self._fix_complete_sql_schema_issues(sql, chart_analysis, query, threshold_info)
                 call['parameters']['sql_query'] = sql
             enhanced_calls.append(call)
         return enhanced_calls
@@ -2159,21 +2411,85 @@ LIMIT 20
             chart_requirements = """PIE CHART REQUIRED:
 - Use execute_dynamic_sql_with_graph tool
 - SQL must return exactly 2 columns: category (text) and value (number)
-- Example: SELECT 'Successful' as category, COUNT(*) as value FROM ... UNION ALL SELECT 'Failed' as category, COUNT(*) as value FROM ..."""
+- For payment success rates: SELECT 'Successful' as category, COUNT(*) as value FROM subscription_payment_details WHERE status = 'ACTIVE' UNION ALL SELECT 'Failed' as category, COUNT(*) as value FROM subscription_payment_details WHERE status != 'ACTIVE'
+- For other breakdowns: Use UNION ALL to combine categories"""
         elif chart_type == 'bar':
             chart_requirements = """BAR CHART REQUIRED:
 - Use execute_dynamic_sql_with_graph tool  
 - SQL should return category and value columns
+- For "top N" requests: ALWAYS include LIMIT N in the SQL
+- For merchant rankings: ORDER BY value DESC LIMIT N
 - Limit to reasonable number of bars (≤30)"""
         elif chart_type == 'line':
             chart_requirements = """LINE CHART REQUIRED:
 - Use execute_dynamic_sql_with_graph tool
 - SQL should return time/period and value columns
 - Order by time ascending"""
+        elif chart_analysis.get('wants_visualization', False):
+            chart_requirements = """VISUALIZATION REQUESTED:
+- Use execute_dynamic_sql_with_graph tool
+- User wants a chart/graph visualization
+- Choose appropriate chart type based on data structure
+- CRITICAL: MUST use execute_dynamic_sql_with_graph, NOT execute_dynamic_sql
+- ALWAYS include graph_type parameter in the tool call"""
         else:
             chart_requirements = "No chart requested."
 
-        prompt = f"""You are an expert SQL analyst for subscription data. Generate VALID JSON tool calls.
+        # Add improvement context prominently at the top if available
+        improvement_header = ""
+        force_graph_tool = ""
+        
+        if improvement_context and improvement_context.strip():
+            improvement_header = f"""
+🚨 CRITICAL USER FEEDBACK AND IMPROVEMENT REQUESTS:
+{improvement_context}
+
+⚠️ PAY ATTENTION: The user has provided specific feedback about what they want changed. 
+You MUST incorporate this feedback in your response.
+"""
+            
+            # IMPROVED: Check if user requested a chart/graph in feedback
+            improvement_lower = improvement_context.lower()
+            if any(phrase in improvement_lower for phrase in ['bar chart', 'bar graph', 'pie chart', 'pie graph', 'line chart', 'line graph', 'graph', 'chart', 'visualize', 'generate a bar', 'generate a pie', 'generate a line', 'draw bar', 'draw pie', 'draw line', 'show a graph', 'generate a graph', 'gnereate a grpah']):
+                force_graph_tool = """
+🚨 CHART REQUESTED: User has specifically requested a chart/graph visualization.
+You MUST use execute_dynamic_sql_with_graph tool, NOT execute_dynamic_sql.
+CRITICAL: If user asks for a graph/chart, ALWAYS use execute_dynamic_sql_with_graph tool.
+"""
+        
+        # IMPROVED: Extract and enforce "top N" limitations
+        top_n_pattern = re.search(r'top\s+(\d+)', user_query_lower)
+        limit_clause = ""
+        if top_n_pattern:
+            limit_number = int(top_n_pattern.group(1))
+            limit_clause = f"""
+🚨 TOP {limit_number} LIMITATION DETECTED:
+- User specifically requested "top {limit_number}" 
+- You MUST add "LIMIT {limit_number}" to your SQL query
+- Do NOT return more than {limit_number} rows
+- Example: SELECT ... ORDER BY ... LIMIT {limit_number}
+"""
+
+        # IMPROVED: Check for query type corrections in feedback
+        query_type_correction = ""
+        if improvement_context and improvement_context.strip():
+            improvement_lower = improvement_context.lower()
+            if any(word in improvement_lower for word in ['transaction', 'transactions']) and any(word in improvement_lower for word in ['subscription', 'subscriptions']):
+                query_type_correction = """
+🚨 QUERY TYPE CORRECTION DETECTED:
+- User wants TRANSACTIONS (payments), NOT subscriptions
+- Use subscription_payment_details table, NOT subscription_contract_v2
+- Query the created_date field for transaction dates
+"""
+            elif any(word in improvement_lower for word in ['payment', 'payments']) and any(word in improvement_lower for word in ['subscription', 'subscriptions']):
+                query_type_correction = """
+🚨 QUERY TYPE CORRECTION DETECTED:
+- User wants PAYMENTS, NOT subscriptions  
+- Use subscription_payment_details table, NOT subscription_contract_v2
+- Query the created_date field for payment dates
+"""
+
+        prompt = f"""{improvement_header}{force_graph_tool}{limit_clause}{query_type_correction}You are an expert SQL analyst for subscription data. Generate VALID JSON tool calls.
 
 🚨 CRITICAL COLUMN NAMES (EXACT SPELLING REQUIRED):
 - subcription_start_date (NOT subscription_start_date) - TYPO IS CONFIRMED
@@ -2190,6 +2506,10 @@ LIMIT 20
 7. For ORDER BY with COALESCE: Use the full COALESCE expression, not the alias
 8. For value queries: Start with less restrictive filters - if user asks for "top customers", show ALL customers ordered by value
 9. Only add restrictive filters (> 0) if specifically asked for "customers with subscriptions" or "paying customers"
+10. ALWAYS add LIMIT clause when user requests "top N" - e.g., "top 5" = LIMIT 5, "top 10" = LIMIT 10
+11. CRITICAL: When user requests ANY chart/graph/visualization, ALWAYS use execute_dynamic_sql_with_graph tool
+12. CRITICAL: If user feedback contains "graph", "chart", "visualize", "show a graph", "generate a graph" - ALWAYS use execute_dynamic_sql_with_graph tool
+13. CRITICAL: For status breakdown requests (ACTIVE, CLOSED, REJECT, INIT) - use "SELECT status as category, COUNT(*) as value FROM table GROUP BY status" - DO NOT use CASE WHEN binary classification
 
 🔧 AVAILABLE TOOLS (USE EXACT NAMES):
 - execute_dynamic_sql: for data queries without charts
@@ -2231,6 +2551,11 @@ EXAMPLE CORRECT QUERIES:
 [{{"tool": "execute_dynamic_sql", "parameters": {{"sql_query": "SELECT c.merchant_user_id, COALESCE(c.user_email, 'Email not provided') as email, COALESCE(c.user_name, 'Name not provided') as name, COALESCE(c.renewal_amount, c.max_amount_decimal, 0) as subscription_value FROM subscription_contract_v2 c ORDER BY COALESCE(c.renewal_amount, c.max_amount_decimal, 0) DESC LIMIT 10"}}}}]
 ```
 
+✅ Top 5 merchants by payment revenue (with LIMIT):
+```json
+[{{"tool": "execute_dynamic_sql_with_graph", "parameters": {{"sql_query": "SELECT c.merchant_user_id, COUNT(*) AS total_payments FROM subscription_payment_details p JOIN subscription_contract_v2 c ON p.subscription_id = c.subscription_id WHERE p.status = 'ACTIVE' GROUP BY c.merchant_user_id ORDER BY total_payments DESC LIMIT 5", "graph_type": "bar"}}}}]
+```
+
 ✅ Auto-renewal subscriptions:
 ```json
 [{{"tool": "execute_dynamic_sql", "parameters": {{"sql_query": "SELECT COALESCE(c.user_email, 'Email not provided') as email, COALESCE(c.user_name, 'Name not provided') as name, c.subcription_end_date FROM subscription_contract_v2 c WHERE c.auto_renewal = 1 AND c.subcription_end_date IS NOT NULL ORDER BY c.subcription_end_date LIMIT 50"}}}}]
@@ -2244,6 +2569,11 @@ EXAMPLE CORRECT QUERIES:
 ✅ Payment trends weekly (MySQL):
 ```json
 [{{"tool": "execute_dynamic_sql_with_graph", "parameters": {{"sql_query": "SELECT CONCAT(YEAR(p.created_date), '-W', LPAD(WEEK(p.created_date), 2, '0')) AS week_period, SUM(p.trans_amount_decimal) AS value FROM subscription_payment_details p WHERE p.status = 'ACTIVE' AND p.created_date >= DATE_SUB(CURDATE(), INTERVAL 12 WEEK) GROUP BY CONCAT(YEAR(p.created_date), '-W', LPAD(WEEK(p.created_date), 2, '0')) ORDER BY week_period", "graph_type": "line"}}}}]
+```
+
+✅ Subscription status breakdown (individual statuses):
+```json
+[{{"tool": "execute_dynamic_sql_with_graph", "parameters": {{"sql_query": "SELECT status as category, COUNT(*) as value FROM subscription_contract_v2 GROUP BY status ORDER BY value DESC", "graph_type": "pie"}}}}]
 ```
 
 ✅ Weekly revenue from May (MySQL):
@@ -2594,20 +2924,32 @@ LIMIT 50
             # Look for feedback in last few turns
             for line in reversed(history[-6:]):  # Increased search range
                 line_lower = line.lower()
-                # Check for specific chart type feedback
-                if 'use pie chart' in line_lower or 'pie chart instead' in line_lower:
+                
+                # IMPROVED: More comprehensive chart type feedback detection
+                # Check for specific improvement suggestions first
+                if any(phrase in line_lower for phrase in ['use pie chart', 'pie chart instead', 'try pie chart', 'pie chart would be better', 'pie chart please']):
                     return "User specifically requested PIE CHART visualization"
-                elif 'use bar chart' in line_lower or 'bar chart instead' in line_lower:
+                elif any(phrase in line_lower for phrase in ['use bar chart', 'bar chart instead', 'try bar chart', 'bar chart would be better', 'bar chart please']):
                     return "User specifically requested BAR CHART visualization"
-                elif ('use line chart' in line_lower or 'line chart instead' in line_lower or 
-                      'use line graph' in line_lower or 'line graph instead' in line_lower):
+                elif any(phrase in line_lower for phrase in ['use line chart', 'line chart instead', 'try line chart', 'line chart would be better', 'line chart please', 'use line graph', 'line graph instead', 'try line graph']):
                     return "User specifically requested LINE CHART visualization"
-                elif 'pie chart' in line_lower:
+                elif any(phrase in line_lower for phrase in ['use scatter', 'scatter plot', 'scatter chart']):
+                    return "User specifically requested SCATTER PLOT visualization"
+                
+                # IMPROVED: Check for query type corrections
+                elif any(word in line_lower for word in ['transaction', 'transactions']) and any(word in line_lower for word in ['subscription', 'subscriptions']):
+                    return "User is correcting query type - they want TRANSACTIONS, not subscriptions"
+                elif any(word in line_lower for word in ['payment', 'payments']) and any(word in line_lower for word in ['subscription', 'subscriptions']):
+                    return "User is correcting query type - they want PAYMENTS, not subscriptions"
+                # Fallback to simple pattern matching
+                elif 'pie chart' in line_lower or 'pie graph' in line_lower:
                     return "User specifically requested PIE CHART visualization"
-                elif 'bar chart' in line_lower:
+                elif 'bar chart' in line_lower or 'bar graph' in line_lower:
                     return "User specifically requested BAR CHART visualization"
                 elif 'line chart' in line_lower or 'line graph' in line_lower:
                     return "User specifically requested LINE CHART visualization"
+                elif 'scatter' in line_lower:
+                    return "User specifically requested SCATTER PLOT visualization"
                 elif 'improve' in line_lower and ('rate' in line_lower or 'success' in line_lower):
                     return "User wants success/failure rate analysis"
                 elif 'try again' in line_lower:
@@ -2620,7 +2962,8 @@ LIMIT 50
                     return "User wants specific threshold/number analysis"
             
             return ""
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Could not extract recent feedback: {e}")
             return ""
 
     def _analyze_complete_chart_requirements(self, user_query: str, history: List[str]) -> Dict:
@@ -2635,16 +2978,53 @@ LIMIT 50
             'needs_success_failure_breakdown': False
         }
         
-        # Check for visualization keywords
+        # IMPROVED: Check for feedback in parentheses (from recursive feedback loop)
+        feedback_match = re.search(r'\((.*?)\)', user_query)
+        if feedback_match:
+            feedback_text = feedback_match.group(1).lower()
+            logger.info(f"[CHART] Found feedback in parentheses: '{feedback_text}'")
+            
+            # Check feedback for chart requests
+            if any(phrase in feedback_text for phrase in ['bar chart', 'bar graph', 'generate bar', 'draw bar', 'bar graph showing']):
+                analysis['chart_type'] = 'bar'
+                analysis['wants_visualization'] = True
+                analysis['specific_request'] = f"User specifically requested BAR CHART in feedback: '{feedback_text}'"
+                logger.info(f"[CHART] Detected BAR CHART request in feedback")
+            elif any(phrase in feedback_text for phrase in ['pie chart', 'pie graph', 'generate pie', 'draw pie']):
+                analysis['chart_type'] = 'pie'
+                analysis['wants_visualization'] = True
+                analysis['specific_request'] = f"User specifically requested PIE CHART in feedback: '{feedback_text}'"
+                logger.info(f"[CHART] Detected PIE CHART request in feedback")
+            elif any(phrase in feedback_text for phrase in ['line chart', 'line graph', 'generate line', 'draw line']):
+                analysis['chart_type'] = 'line'
+                analysis['wants_visualization'] = True
+                analysis['specific_request'] = f"User specifically requested LINE CHART in feedback: '{feedback_text}'"
+                logger.info(f"[CHART] Detected LINE CHART request in feedback")
+            elif any(phrase in feedback_text for phrase in ['scatter', 'scatter plot', 'generate scatter']):
+                analysis['chart_type'] = 'scatter'
+                analysis['wants_visualization'] = True
+                analysis['specific_request'] = f"User specifically requested SCATTER PLOT in feedback: '{feedback_text}'"
+                logger.info(f"[CHART] Detected SCATTER PLOT request in feedback")
+            elif any(phrase in feedback_text for phrase in ['chart', 'graph', 'visualize', 'draw', 'show a graph', 'generate a graph', 'gnereate a grpah']):
+                analysis['wants_visualization'] = True
+                analysis['specific_request'] = f"User requested visualization in feedback: '{feedback_text}'"
+                logger.info(f"[CHART] Detected general visualization request in feedback")
+        
+        # Check for visualization keywords in main query
         viz_keywords = ['chart', 'graph', 'plot', 'visualize', 'show', 'display', 'visually']
         if any(keyword in query_lower for keyword in viz_keywords):
             analysis['wants_visualization'] = True
         
-        # Detect specific chart types
-        for chart_type, keywords in self.chart_keywords.items():
-            if any(keyword in query_lower for keyword in keywords):
-                analysis['chart_type'] = chart_type
-                break
+        # Detect specific chart types with improved detection (only if not already detected from feedback)
+        if not analysis['chart_type']:
+            for chart_type, keywords in self.chart_keywords.items():
+                if any(keyword in query_lower for keyword in keywords):
+                    analysis['chart_type'] = chart_type
+                    # Store the specific keyword that matched for better context
+                    matched_keyword = next((kw for kw in keywords if kw in query_lower), None)
+                    if matched_keyword:
+                        analysis['specific_request'] = f"User requested {chart_type.upper()} chart via '{matched_keyword}'"
+                    break
         
         # Check for merchant analysis
         if 'merchant' in query_lower and ('transaction' in query_lower or 'payment' in query_lower):
@@ -2653,6 +3033,10 @@ LIMIT 50
         # Check for success/failure analysis
         if any(word in query_lower for word in ['success', 'failure', 'rate']):
             analysis['needs_success_failure_breakdown'] = True
+        
+        # Check for specific status breakdown requests
+        if any(word in query_lower for word in ['status', 'active', 'closed', 'reject', 'init']) and 'breakdown' in query_lower:
+            analysis['needs_status_breakdown'] = True
         
         # Check history for chart requests
         if not analysis['chart_type'] and history:
@@ -2678,11 +3062,16 @@ LIMIT 50
                 analysis['data_aggregation'] = 'success_failure_breakdown'
             else:
                 analysis['data_aggregation'] = 'total_summary'
-        elif 'trend' in query_lower or 'over time' in query_lower:
+        elif 'trend' in query_lower or 'over time' in query_lower or 'weekly' in query_lower or 'monthly' in query_lower or 'daily' in query_lower:
             analysis['data_aggregation'] = 'time_series'
+            # Override chart type for time series data
+            if analysis['chart_type'] == 'pie':
+                analysis['chart_type'] = 'line'
+                analysis['specific_request'] = "Time series data detected - switching from pie to line chart"
         elif 'rate' in query_lower or 'percentage' in query_lower:
             analysis['data_aggregation'] = 'rate_calculation'
         
+        logger.info(f"[CHART] Final chart analysis: {analysis}")
         return analysis
 
     def _get_complete_chart_guidance(self, chart_analysis: Dict) -> str:
@@ -2706,6 +3095,13 @@ LIMIT 50
         
         if chart_analysis['needs_success_failure_breakdown']:
             guidance.append("- SUCCESS/FAILURE: Use aggregated success vs failure analysis")
+        
+        if chart_analysis.get('needs_status_breakdown', False):
+            guidance.append("- STATUS BREAKDOWN: Show individual status values (ACTIVE, CLOSED, REJECT, INIT)")
+            guidance.append("- USE: GROUP BY status to show each status separately")
+            guidance.append("- DO NOT: Group into binary success/failure categories")
+            guidance.append("- SQL PATTERN: SELECT status as category, COUNT(*) as value FROM table GROUP BY status")
+            guidance.append("- CRITICAL: Do NOT use CASE WHEN status = 'ACTIVE' THEN 'Successful' ELSE 'Failed'")
         
         if chart_analysis['chart_type'] == 'pie':
             guidance.append("- PIE CHART REQUIRES: Aggregated summary data with categories and totals")
@@ -2744,6 +3140,32 @@ LIMIT 50
 SELECT MAX(DATE(created_date)) as last_payment_date FROM subscription_payment_details
 UNION ALL
 SELECT MAX(DATE(subcription_start_date)) as last_subscription_date FROM subscription_contract_v2
+"""
+            
+            # Handle status breakdown queries
+            if chart_analysis.get('needs_status_breakdown', False):
+                logger.warning("🔧 Fixing status breakdown query to show individual statuses")
+                # Check if the current SQL is using binary classification instead of individual statuses
+                if 'CASE WHEN status' in sql_query and 'Successful' in sql_query and 'Failed' in sql_query:
+                    logger.warning("🔧 Detected binary status classification, converting to individual status breakdown")
+                
+                if 'subscription' in user_query.lower() or 'subscription_contract_v2' in sql_query:
+                    sql_query = """
+SELECT 
+    status as category,
+    COUNT(*) as value
+FROM subscription_contract_v2 
+GROUP BY status
+ORDER BY value DESC
+"""
+                elif 'payment' in user_query.lower() or 'subscription_payment_details' in sql_query:
+                    sql_query = """
+SELECT 
+    status as category,
+    COUNT(*) as value
+FROM subscription_payment_details 
+GROUP BY status
+ORDER BY value DESC
 """
             
             # Original schema fixes...
@@ -2912,6 +3334,28 @@ GROUP BY CASE WHEN total_transactions > {threshold} THEN 'More than {threshold} 
         
         return sql_query
 
+    def _enforce_top_n_limit(self, sql_query: str, user_query: str) -> str:
+        """Enforce LIMIT clause when 'top N' is requested."""
+        import re
+        
+        # Check for "top N" pattern in user query
+        top_n_match = re.search(r'top\s+(\d+)', user_query.lower())
+        if not top_n_match:
+            return sql_query
+        
+        limit_number = int(top_n_match.group(1))
+        
+        # Check if LIMIT is already present
+        if re.search(r'LIMIT\s+\d+', sql_query, re.IGNORECASE):
+            # Update existing LIMIT to the requested number
+            sql_query = re.sub(r'LIMIT\s+\d+', f'LIMIT {limit_number}', sql_query, flags=re.IGNORECASE)
+        else:
+            # Add LIMIT clause at the end
+            sql_query = sql_query.rstrip().rstrip(';') + f' LIMIT {limit_number}'
+        
+        logger.info(f"🔧 Enforced LIMIT {limit_number} for 'top {limit_number}' request")
+        return sql_query
+
     def _fix_sql_date_math(self, sql_query: str, user_query: str = None) -> str:
         """Convert SQLite-style date math to MySQL-compatible syntax. Handles both single and double quotes and all common intervals."""
         import re
@@ -3059,6 +3503,10 @@ GROUP BY CASE WHEN total_transactions > {threshold} THEN 'More than {threshold} 
             
         return sql_query
 
+    def record_feedback(self, query, feedback):
+        self.last_feedback = feedback
+        self.last_feedback_query = query
+
 class CompleteEnhancedResultFormatter:
     """COMPLETE enhanced result formatter with smart insights and better presentation."""
     
@@ -3067,6 +3515,39 @@ class CompleteEnhancedResultFormatter:
     
     def format_single_result(self, result, show_details=False, show_graph=True):
         """Enhanced result formatting with better NULL handling and validation"""
+        # ENFORCE: Always show graph if tool_used is execute_dynamic_sql_with_graph or wants_graph is True
+        wants_graph = False
+        tool_used = None
+        data = None
+        graph_type = 'bar'
+        query = ''
+        if hasattr(result, 'tool_used'):
+            tool_used = result.tool_used
+        if hasattr(result, 'wants_graph'):
+            wants_graph = result.wants_graph
+        if hasattr(result, 'data'):
+            data = result.data
+        if hasattr(result, 'parameters') and result.parameters:
+            graph_type = result.parameters.get('graph_type', 'bar')
+        if hasattr(result, 'original_query'):
+            query = result.original_query
+        # Also support dicts
+        if isinstance(result, dict):
+            tool_used = result.get('tool_used', tool_used)
+            wants_graph = result.get('wants_graph', wants_graph)
+            data = result.get('data', data)
+            params = result.get('parameters', {})
+            if params:
+                graph_type = params.get('graph_type', graph_type)
+            query = result.get('original_query', query)
+        if (tool_used == 'execute_dynamic_sql_with_graph' or wants_graph) and data and isinstance(data, list) and len(data) > 0:
+            graph_data = {
+                'data': data,
+                'graph_type': graph_type
+            }
+            graph_path = self.graph_generator.generate_graph(graph_data, query)
+            if graph_path:
+                print_success(f"\n[Graph generated: {graph_path}]")
         if not result or not isinstance(result, dict):
             return {"error": "No data available"}
             
@@ -3108,8 +3589,61 @@ class CompleteEnhancedResultFormatter:
         return formatted_row
     
     def format_result(self, result, show_details=False, show_graph=True):
-        """Enhanced result formatting with empty result handling"""
-        if not result or (isinstance(result, list) and len(result) == 0):
+        """Enhanced result formatting with empty result handling and debug output"""
+        print("[DEBUG] Raw result passed to formatter:", repr(result))  # Add debug output
+        if result is None:
+            return """
+======
+RESULT
+======
+Query executed but returned no data.
+This could indicate:
+- Empty result set
+- SQL syntax errors
+- Invalid column names or table references
+
+Please check your query and try again.
+------------------------------------------------------------
+"""
+        # If result is a list with at least one dict, show all as table if more than 1 row
+        if isinstance(result, list) and len(result) > 0 and isinstance(result[0], dict):
+            if len(result) == 1:
+                formatted = self.format_single_result(result[0], show_details, show_graph)
+                if "error" in formatted:
+                    return f"""
+======
+RESULT
+======
+{formatted["error"]}
+------------------------------------------------------------
+"""
+                output = "\n======\nRESULT\n======\n"
+                for k, v in formatted.items():
+                    output += f"{k}: {v}\n"
+                # If this is a success/failure breakdown, add rates
+                if len(result) == 2 and all('category' in row and 'value' in row for row in result):
+                    cats = {row['category'].lower(): row['value'] for row in result}
+                    total = sum(cats.values())
+                    if total > 0 and any(cat in cats for cat in ['success', 'failure', 'failed']):
+                        success = cats.get('success', 0)
+                        failure = cats.get('failure', cats.get('failed', 0))
+                        output += f"Success Rate: {success / total * 100:.1f}%\n"
+                        output += f"Failure Rate: {failure / total * 100:.1f}%\n"
+                output += "------------------------------------------------------------\n"
+                return output
+            else:
+                # Table format for multiple rows
+                headers = list(result[0].keys())
+                output = "\n======\nRESULT\n======\n"
+                output += " | ".join(headers) + "\n"
+                output += "------" + "-" * (len(" | ".join(headers)) - 6) + "\n"
+                for row in result:
+                    values = [str(row.get(h, 'N/A')) for h in headers]
+                    output += " | ".join(values) + "\n"
+                output += "------------------------------------------------------------\n"
+                return output
+        # If result is a list but empty, show no data
+        if isinstance(result, list) and len(result) == 0:
             return """
 ======
 RESULT
@@ -3125,65 +3659,6 @@ Try:
 - Simplifying your request
 ------------------------------------------------------------
 """
-        
-        # Handle None result
-        if result is None:
-            return """
-======
-RESULT
-======
-Query executed but returned no data.
-This could indicate:
-- Empty result set
-- SQL syntax errors
-- Invalid column names or table references
-
-Please check your query and try again.
-------------------------------------------------------------
-"""
-        
-        # Continue with existing formatting for valid results
-        if isinstance(result, list):
-            if len(result) == 1 and isinstance(result[0], dict):
-                # Single row result
-                formatted = self.format_single_result(result[0], show_details, show_graph)
-                if "error" in formatted:
-                    return f"""
-======
-RESULT
-======
-{formatted["error"]}
-------------------------------------------------------------
-"""
-                
-                output = "\n======\nRESULT\n======\n"
-                for k, v in formatted.items():
-                    output += f"{k}: {v}\n"
-                output += "------------------------------------------------------------\n"
-                return output
-            else:
-                # Multiple rows - use table format
-                if not result:
-                    return self.format_result([], show_details, show_graph)
-                
-                # Format as table
-                formatted_rows = [self.format_single_result(row, show_details, show_graph) for row in result if row]
-                if not formatted_rows:
-                    return self.format_result([], show_details, show_graph)
-                
-                headers = list(formatted_rows[0].keys())
-                
-                output = "\n======\nRESULT\n======\n"
-                output += " | ".join(headers) + "\n"
-                output += "------" + "-" * (len(" | ".join(headers)) - 6) + "\n"
-                
-                for row in formatted_rows:
-                    values = [str(row.get(h, 'N/A')) for h in headers]
-                    output += " | ".join(values) + "\n"
-                
-                output += "------------------------------------------------------------\n"
-                return output
-        
         # Handle other result types
         return f"""
 ======
@@ -3264,6 +3739,9 @@ class CompleteEnhancedUniversalClient:
 
     async def call_tool(self, tool_name: str, parameters: Dict = None, original_query: str = "", wants_graph: bool = False) -> QueryResult:
         """Complete enhanced tool calling with smart graph handling."""
+        # ENFORCE: Always apply LIMIT enforcement to the SQL before execution
+        if parameters and 'sql_query' in parameters:
+            parameters['sql_query'] = self.nlp._enforce_top_n_limit(parameters['sql_query'], original_query)
         if tool_name == 'execute_dynamic_sql_with_graph':
             return await self._handle_complete_smart_sql_with_graph(parameters, original_query)
         
@@ -3289,8 +3767,9 @@ class CompleteEnhancedUniversalClient:
                             error=f"HTTP {response.status}: {error_text}",
                             tool_used=tool_name
                         )
-                    
                     result_data = await response.json()
+                    print("[DEBUG] Raw API response:", result_data)  # Add debug output
+                    # Always set generated_sql to the final SQL (with LIMIT)
                     return QueryResult(
                         success=result_data.get('success', False),
                         data=result_data.get('data'),
@@ -3300,7 +3779,7 @@ class CompleteEnhancedUniversalClient:
                         parameters=parameters,
                         is_dynamic=(tool_name == 'execute_dynamic_sql'),
                         original_query=original_query,
-                        generated_sql=parameters.get('sql_query') if tool_name == 'execute_dynamic_sql' else None
+                        generated_sql=parameters.get('sql_query') if 'sql_query' in parameters else None
                     )
             except ssl.SSLError as ssl_error:
                 if not self.ssl_disabled:
@@ -3336,38 +3815,33 @@ class CompleteEnhancedUniversalClient:
     async def _handle_complete_smart_sql_with_graph(self, parameters: Dict, original_query: str) -> QueryResult:
         """FIXED: Complete smart SQL with graph generation handling."""
         try:
+            # ENFORCE: Always apply LIMIT enforcement to the SQL before execution
+            if parameters and 'sql_query' in parameters:
+                parameters['sql_query'] = self.nlp._enforce_top_n_limit(parameters['sql_query'], original_query)
             # Execute SQL first
             sql_result = await self.call_tool('execute_dynamic_sql', {
                 'sql_query': parameters['sql_query']
             }, original_query)
-            
+            # Always set generated_sql to the final SQL (with LIMIT)
+            sql_result.generated_sql = parameters['sql_query']
             if not sql_result.success or not sql_result.data:
                 if sql_result.success:
                     sql_result.message = (sql_result.message or "") + "\n💡 No data returned - cannot generate complete graph"
                 return sql_result
-            
             logger.info(f"📊 Complete SQL returned {len(sql_result.data)} rows for graph analysis")
-            
             if not self.graph_generator.can_generate_graphs():
                 sql_result.message = (sql_result.message or "") + "\n⚠️ Complete graph generation unavailable (matplotlib not installed)"
                 return sql_result
-            
             # Generate graph with complete enhanced handling
             try:
-                # FIXED: Pass SQL result data directly to graph generator
                 graph_data = {
                     'data': sql_result.data,  # Pass SQL result data
                     'graph_type': parameters.get('graph_type', 'bar'),
                     'title': self._generate_complete_smart_title(original_query),
                     'description': f"Generated from: {original_query}"
                 }
-                
-                # ENFORCE: Always set graph_type in graph_data to the overridden value
                 enforced_type = parameters.get('graph_type', 'auto')
-                
-                # If no graph_type specified, let the AI decide based on query content
                 if enforced_type == 'auto':
-                    # Smart detection based on query keywords
                     query_lower = original_query.lower()
                     if any(word in query_lower for word in ['trend', 'trends', 'over time', 'timeline', 'payment trends']):
                         enforced_type = 'line'
@@ -3378,29 +3852,22 @@ class CompleteEnhancedUniversalClient:
                     else:
                         enforced_type = 'bar'  # Default fallback
                         logger.info(f"[SMART-DETECT] Using default bar chart")
-                
                 graph_data['graph_type'] = enforced_type
                 logger.info(f"[ENFORCE] Setting graph_data['graph_type'] = '{enforced_type}' (from params: {parameters.get('graph_type', 'not_set')}) for query: {original_query[:50]}...")
-                
                 graph_filepath = self.graph_generator.generate_graph(
                     graph_data, original_query
                 )
-                
                 sql_result.graph_data = graph_data
                 sql_result.graph_generated = graph_filepath is not None
-                
                 if graph_filepath:
                     sql_result.graph_filepath = graph_filepath
                     sql_result.message = (sql_result.message or "") + f"\n📊 Complete graph generated successfully"
                 else:
                     sql_result.message = (sql_result.message or "") + f"\n⚠️ Complete graph data generated but file creation failed"
-            
             except Exception as graph_error:
                 logger.error(f"Complete graph generation error: {graph_error}")
                 sql_result.message = (sql_result.message or "") + f"\n⚠️ Complete graph generation failed: {str(graph_error)}"
-            
             return sql_result
-            
         except Exception as e:
             logger.error(f"Error in complete smart SQL with graph: {e}")
             # Fallback to regular SQL
@@ -3631,25 +4098,46 @@ async def complete_enhanced_interactive_mode():
                                     print(f"📝 Result {i} was generated using COMPLETE AI with semantic learning!")
                                     print("Your feedback helps the system learn and improve over time.")
                                     
+                                    last_query = query
+                                    last_result = individual_result
+                                    last_history = list(client.history) if hasattr(client, 'history') else []
                                     while True:
                                         try:
                                             feedback_input = input(f"Was Result {i} helpful? (y/n/skip): ").lower().strip()
                                             if feedback_input in ['y', 'yes']:
-                                                await client.submit_feedback(individual_result, True)
+                                                await client.submit_feedback(last_result, True)
                                                 print("🧠 Positive feedback recorded in semantic learning system!")
                                                 print_section('💡 Your feedback will be used to improve future answers to similar queries.')
                                                 break
                                             elif feedback_input in ['n', 'no']:
                                                 improvement = input("How can this be improved? (e.g., 'use pie chart instead', 'fix SQL error'): ").strip()
                                                 if improvement.lower() not in ['skip', 's', '']:
-                                                    await client.submit_feedback(individual_result, False, improvement)
+                                                    await client.submit_feedback(last_result, False, improvement)
                                                     print("🧠 Negative feedback and improvement recorded - the system will learn!")
                                                     print_section('💡 Your feedback will be used to improve future answers to similar queries.')
+                                                    # PATCH: Inject feedback into history for immediate retry
+                                                    last_history.append(f"How can this be improved? {improvement}")
                                                 else:
-                                                    await client.submit_feedback(individual_result, False)
+                                                    await client.submit_feedback(last_result, False)
                                                     print("🧠 Negative feedback recorded!")
                                                     print_section('💡 Your feedback will be used to improve future answers to similar queries.')
-                                                break
+                                                    # PATCH: Still inject a generic feedback line for retry
+                                                    last_history.append("How can this be improved? (no details)")
+                                                # PATCH: Re-run the last query after negative feedback
+                                                print(f"\n🔄 Regenerating answer for Result {i} based on your feedback...\n")
+                                                last_result = await client.query(last_query, history=last_history)
+                                                # For multitool, get the i-th result again if possible
+                                                if isinstance(last_result, list) and len(last_result) >= i:
+                                                    new_individual_result = last_result[i-1]
+                                                else:
+                                                    new_individual_result = last_result if hasattr(last_result, 'data') else last_result
+                                                if hasattr(new_individual_result, 'data'):
+                                                    output = client.formatter.format_result(new_individual_result.data, show_details=args.show_details)
+                                                else:
+                                                    output = client.formatter.format_result(new_individual_result, show_details=args.show_details)
+                                                print(f"\n{output}")
+                                                last_result = new_individual_result
+                                                continue  # Ask for feedback again
                                             elif feedback_input in ['s', 'skip', '']:
                                                 break
                                             else:
@@ -3666,31 +4154,51 @@ async def complete_enhanced_interactive_mode():
                                 print("📝 This answer was generated using COMPLETE AI with semantic learning!")
                                 print("Your feedback helps the system learn and improve over time.")
                                 
+                                last_query = query
+                                last_result = result
+                                last_history = list(client.history) if hasattr(client, 'history') else []
                                 while True:
                                     try:
                                         feedback_input = input("Was this helpful? (y/n/skip): ").lower().strip()
                                         if feedback_input in ['y', 'yes']:
-                                            await client.submit_feedback(result, True)
+                                            await client.submit_feedback(last_result, True)
                                             print("🧠 Positive feedback recorded in semantic learning system!")
                                             print_section('💡 Your feedback will be used to improve future answers to similar queries.')
                                             break
                                         elif feedback_input in ['n', 'no']:
                                             improvement = input("How can this be improved? (e.g., 'use pie chart instead', 'fix SQL error'): ").strip()
                                             if improvement.lower() not in ['skip', 's', '']:
-                                                await client.submit_feedback(result, False, improvement)
+                                                await client.submit_feedback(last_result, False, improvement)
                                                 print("🧠 Negative feedback and improvement recorded - the system will learn!")
                                                 print_section('💡 Your feedback will be used to improve future answers to similar queries.')
+                                                # PATCH: Inject feedback into history for immediate retry
+                                                last_history.append(f"How can this be improved? {improvement}")
                                             else:
-                                                await client.submit_feedback(result, False)
+                                                await client.submit_feedback(last_result, False)
                                                 print("🧠 Negative feedback recorded!")
                                                 print_section('💡 Your feedback will be used to improve future answers to similar queries.')
-                                            break
+                                                # PATCH: Still inject a generic feedback line for retry
+                                                last_history.append("How can this be improved? (no details)")
+                                            # PATCH: Re-run the last query after negative feedback
+                                            print("\n🔄 Regenerating answer based on your feedback...\n")
+                                            last_result = await client.query(last_query, history=last_history)
+                                            if hasattr(last_result, 'data'):
+                                                output = client.formatter.format_result(last_result.data, show_details=args.show_details)
+                                            else:
+                                                output = client.formatter.format_result(last_result, show_details=args.show_details)
+                                            print(f"\n{output}")
+                                            continue  # Ask for feedback again
                                         elif feedback_input in ['s', 'skip', '']:
                                             break
                                         else:
                                             print("Please enter 'y', 'n', or 'skip'.")
                                     except (KeyboardInterrupt, EOFError):
                                         break
+                                # If feedback was negative, loop will repeat and regenerate improved answer
+                                if feedback_input in ['n', 'no']:
+                                    continue
+                                else:
+                                    break
                     except Exception as format_error:
                         logger.error(f"Error formatting COMPLETE output: {format_error}")
                         print(f"❌ Error displaying COMPLETE results: {format_error}")
@@ -3795,6 +4303,7 @@ if __name__ == "__main__":
         "Revenue between 1 april 2025 and 30 april 2025",
         "Show me database status and recent subscription summary",
         "How many new subscriptions did we get this month?",
+        "Show me a pie chart of payment success rates and show me a bar chart of the top 5 merchants by total payment revenue",
         "Show me users with their email addresses and subscription amounts",
         "Show me the top 10 customers by total subscription value",
     ]
@@ -3826,11 +4335,9 @@ if __name__ == "__main__":
                             break
                         if not user_query:
                             continue
-                    
                     # Always reload improvement suggestions before each query for immediate feedback effect
                     if hasattr(client.nlp, '_last_best_chart_type'):
                         del client.nlp._last_best_chart_type
-                    
                     # Context-aware query resolution
                     resolved_query = user_query
                     if 'that day' in user_query.lower() and 'last_date' in client.context:
@@ -3839,74 +4346,9 @@ if __name__ == "__main__":
                         resolved_query = user_query.lower().replace('that merchant', client.context['last_merchant'])
                     if 'that count' in user_query.lower() and 'last_count' in client.context:
                         resolved_query = user_query.lower().replace('that count', str(client.context['last_count']))
-                    
-                    # Process query (handles both single and multitool automatically)
-                    result = await client.query(resolved_query)
-                    print_separator()
-                    
-                    # Format and display results
-                    if isinstance(result, list):
-                        print_header(f"MULTITOOL RESULTS FOR: '{resolved_query}'")
-                        output = client.formatter.format_multi_result(result, resolved_query)
-                        print(f"{output}")
-                        print_separator()
-                        
-                        # Update context with key results from all queries
-                        for individual_result in result:
-                            if individual_result.data and isinstance(individual_result.data, list) and len(individual_result.data) > 0:
-                                row = individual_result.data[0]
-                                if isinstance(row, dict):
-                                    for k, v in row.items():
-                                        if 'date' in k.lower():
-                                            client.context['last_date'] = str(v)
-                                        if 'merchant' in k.lower():
-                                            client.context['last_merchant'] = str(v)
-                                        if 'count' in k.lower() or 'num' in k.lower():
-                                            client.context['last_count'] = v
-                        
-                        # Feedback for multitool results
-                        for i, individual_result in enumerate(result, 1):
-                            if (getattr(individual_result, 'is_dynamic', False) and 
-                                getattr(individual_result, 'success', False) and 
-                                getattr(individual_result, 'data', None) is not None):
-                                
-                                print_feedback_prompt(f"\n📝 Feedback for Query {i} (generated by AI):")
-                                print_feedback_prompt("Your feedback helps the system learn and improve over time.")
-                                feedback_given = False
-                                
-                                while not feedback_given:
-                                    try:
-                                        feedback_input = input(f"{MAGENTA}Was Query {i} helpful? (y/n/skip): {RESET}").lower().strip()
-                                        if feedback_input in ['y', 'yes']:
-                                            await client.submit_feedback(individual_result, True)
-                                            print_success("🧠 Positive feedback recorded in semantic learning system!")
-                                            print_section('💡 Your feedback will be used to improve future answers to similar queries.')
-                                            feedback_given = True
-                                        elif feedback_input in ['n', 'no']:
-                                            improvement = input(f"{MAGENTA}How can this be improved? (e.g., 'use bar chart instead', 'fix SQL error'): {RESET}").strip()
-                                            if improvement.lower() not in ['skip', 's', '']:
-                                                await client.submit_feedback(individual_result, False, improvement)
-                                                print_success("🧠 Negative feedback and improvement recorded - the system will learn!")
-                                                print_section('💡 Your feedback will be used to improve future answers to similar queries.')
-                                            else:
-                                                await client.submit_feedback(individual_result, False)
-                                                print_success("🧠 Negative feedback recorded!")
-                                                print_section('💡 Your feedback will be used to improve future answers to similar queries.')
-                                            feedback_given = True
-                                        elif feedback_input in ['s', 'skip', '']:
-                                            feedback_given = True
-                                        else:
-                                            print_warning("Please enter 'y', 'n', or 'skip'.")
-                                    except (KeyboardInterrupt, EOFError):
-                                        feedback_given = True
-                                print_separator()
-                    else:
-                        # Use format_result for QueryResult objects, format_single_result is for individual data rows
-                        output = client.formatter.format_result(result.data if hasattr(result, 'data') else result, show_details=args.show_details)
-                        print(f"{output}")
-                        print_separator()
-                        
-                        # Update context with key results
+
+                    # --- RECURSIVE FEEDBACK LOOP START ---
+                    def update_context_from_result(result):
                         if result.data and isinstance(result.data, list) and len(result.data) > 0:
                             row = result.data[0]
                             if isinstance(row, dict):
@@ -3917,43 +4359,102 @@ if __name__ == "__main__":
                                         client.context['last_merchant'] = str(v)
                                     if 'count' in k.lower() or 'num' in k.lower():
                                         client.context['last_count'] = v
-                        
-                        # Feedback for single result
-                        if True:
-                            print_feedback_prompt("\n📝 This answer was generated using COMPLETE AI with semantic learning!")
-                            print_feedback_prompt("Your feedback helps the system learn and improve over time.")
-                            
-                            while True:
-                                try:
-                                    feedback_input = input(f"{MAGENTA}Was this helpful? (y/n/skip): {RESET}").lower().strip()
-                                    if feedback_input in ['y', 'yes']:
-                                        await client.submit_feedback(result, True)
-                                        print("🧠 Positive feedback recorded in semantic learning system!")
-                                        print_section('💡 Your feedback will be used to improve future answers to similar queries.')
-                                        break
-                                    elif feedback_input in ['n', 'no']:
-                                        improvement = input(f"{MAGENTA}How can this be improved? (e.g., 'use pie chart instead', 'fix SQL error'): {RESET}").strip()
-                                        if improvement.lower() not in ['skip', 's', '']:
+
+                    async def handle_query_with_feedback(query):
+                        feedback = None
+                        improvement = None
+                        current_query = query
+                        while True:
+                            # If improvement suggestion exists, append it to the query
+                            query_to_run = current_query
+                            if improvement:
+                                query_to_run = f"{current_query} ({improvement})"
+                            result = await client.query(query_to_run)
+                            print_separator()
+                            # Format and display results
+                            if isinstance(result, list):
+                                print_header(f"MULTITOOL RESULTS FOR: '{query_to_run}'")
+                                output = client.formatter.format_multi_result(result, query_to_run)
+                                print(f"{output}")
+                                print_separator()
+                                for individual_result in result:
+                                    update_context_from_result(individual_result)
+                                # Feedback for multitool results (recursive)
+                                all_satisfied = True
+                                for i, individual_result in enumerate(result, 1):
+                                    if (getattr(individual_result, 'is_dynamic', False) and 
+                                        getattr(individual_result, 'success', False) and 
+                                        getattr(individual_result, 'data', None) is not None):
+                                        print_feedback_prompt(f"\n📝 Feedback for Query {i} (generated by AI):")
+                                        print_feedback_prompt("Your feedback helps the system learn and improve over time.")
+                                        while True:
+                                            try:
+                                                feedback_input = input(f"{MAGENTA}Was Query {i} helpful? (y/n/skip): {RESET}").lower().strip()
+                                                if feedback_input in ['y', 'yes', 's', 'skip', '']:
+                                                    if feedback_input in ['y', 'yes']:
+                                                        await client.submit_feedback(individual_result, True)
+                                                        print_success("🧠 Positive feedback recorded in semantic learning system!")
+                                                        print_section('💡 Your feedback will be used to improve future answers to similar queries.')
+                                                    all_satisfied = all_satisfied and True
+                                                    improvement = None  # Reset improvement on positive/skip
+                                                    break
+                                                elif feedback_input in ['n', 'no']:
+                                                    improvement = input(f"{MAGENTA}How can this be improved? (e.g., 'use bar chart instead', 'fix SQL error'): {RESET}").strip()
+                                                    await client.submit_feedback(individual_result, False, improvement)
+                                                    print_success("🧠 Negative feedback and improvement recorded - the system will learn!")
+                                                    print_section('💡 Your feedback will be used to improve future answers to similar queries.')
+                                                    all_satisfied = False
+                                                    break
+                                                else:
+                                                    print_warning("Please enter 'y', 'n', or 'skip'.")
+                                            except (KeyboardInterrupt, EOFError):
+                                                all_satisfied = True
+                                                break
+                                if all_satisfied:
+                                    break
+                                else:
+                                    print_section("Regenerating improved answer(s) based on your feedback...")
+                                    continue  # Regenerate improved answer(s)
+                            else:
+                                output = client.formatter.format_result(result.data if hasattr(result, 'data') else result, show_details=args.show_details)
+                                print(f"{output}")
+                                print_separator()
+                                update_context_from_result(result)
+                                print_feedback_prompt("\n📝 This answer was generated using COMPLETE AI with semantic learning!")
+                                print_feedback_prompt("Your feedback helps the system learn and improve over time.")
+                                while True:
+                                    try:
+                                        feedback_input = input(f"{MAGENTA}Was this helpful? (y/n/skip): {RESET}").lower().strip()
+                                        if feedback_input in ['y', 'yes', 's', 'skip', '']:
+                                            if feedback_input in ['y', 'yes']:
+                                                await client.submit_feedback(result, True)
+                                                print("🧠 Positive feedback recorded in semantic learning system!")
+                                                print_section('💡 Your feedback will be used to improve future answers to similar queries.')
+                                            improvement = None  # Reset improvement on positive/skip
+                                            break
+                                        elif feedback_input in ['n', 'no']:
+                                            improvement = input(f"{MAGENTA}How can this be improved? (e.g., 'use pie chart instead', 'fix SQL error'): {RESET}").strip()
                                             await client.submit_feedback(result, False, improvement)
                                             print("🧠 Negative feedback and improvement recorded - the system will learn!")
                                             print_section('💡 Your feedback will be used to improve future answers to similar queries.')
+                                            print_section("Regenerating improved answer based on your feedback...")
+                                            break  # Regenerate improved answer
                                         else:
-                                            await client.submit_feedback(result, False)
-                                            print("🧠 Negative feedback recorded!")
-                                            print_section('💡 Your feedback will be used to improve future answers to similar queries.')
+                                            print("Please enter 'y', 'n', or 'skip'.")
+                                    except (KeyboardInterrupt, EOFError):
                                         break
-                                    elif feedback_input in ['s', 'skip', '']:
-                                        break
-                                    else:
-                                        print("Please enter 'y', 'n', or 'skip'.")
-                                except (KeyboardInterrupt, EOFError):
+                                # If feedback was negative, loop will repeat and regenerate improved answer
+                                if feedback_input in ['n', 'no']:
+                                    continue
+                                else:
                                     break
-                    
-                    client.manage_history(user_query, output)
+                        client.manage_history(query_to_run, output)
+                    # --- RECURSIVE FEEDBACK LOOP END ---
+
+                    await handle_query_with_feedback(resolved_query)
                 except Exception as e:
                     print_error(f"❌ Error running query: {e}")
                     logger.error(f"Query error: {e}", exc_info=True)
-                
                 args.query = None  # After first run, always prompt interactively
 
     # Run interactive mode or single query
